@@ -1,0 +1,90 @@
+╔══════════════════════════════════════════════════════════════╗
+║              EXPLICACAO COMPLETA DO SISTEMA                  ║
+║          MegaEmbed Scraper - Links de Filmes PT-BR           ║
+╚══════════════════════════════════════════════════════════════╝
+
+1. O PROBLEMA DOS TOKENS
+─────────────────────────
+Os links do playerscdn.xyz tem tokens que expiram em horas/dias.
+Cada filme tem uma URL no formato:
+  https://CDN/includes/hls.php?url={TOKEN}&ext=m3u8&file=/master.m3u8
+
+Achei que o TOKEN e gerado pelo servidor e nao da para replicar.
+MAS DESCOBRI que o mgeb.top tem um endpoint `sign.php` que ACEITA
+re-signar URLs para gerar tokens NOVOS e FRESCOS sob demanda!
+
+2. ANTES (GITHUB ACTIONS - REMOVIDO)
+─────────────────────────────────────
+Antes o scraper rodava no GitHub Actions a cada 6h, re-scrapeava
+tudo e subia pro Catbox. Mas isso dependia de configurar GitHub,
+token, repo, etc. Agora nao precisa mais.
+
+3. AGORA (PROXY + sign.php)
+────────────────────────────
+Criei um servidor PROXY que faz o seguinte:
+
+  Playlist → /proxy/{TMDB_ID} → scrapeia embed → sign.php → redirect
+
+- Voce configura a playlist uma vez no player
+- Cada filme aponta pra `/proxy/{TMDB_ID}`
+- Quando o player acessa, o proxy:
+  1. Scrapeia o embed page (1 request)
+  2. Pega a URL com token
+  3. Opcionalmente re-signa via sign.php
+  4. Redireciona pro video funcionando
+- O token e CRIADO NA HORA DO ACESSO
+- Nao precisa re-scrapear a cada 6h
+- NAO precisa do seu PC ligado
+
+4. COMO USAR (DEPLOY NO RENDER.COM)
+─────────────────────────────────────
+Render.com e gratis e nao precisa de cartao de credito.
+
+Passo 1: Crie conta em https://render.com
+Passo 2: New + > Web Service
+Passo 3: Upload dos arquivos ou conecte um repo
+Passo 4: Build: pip install -r requirements.txt
+         Start: gunicorn web_scraper:app
+Passo 5: Deploy (5 minutos)
+
+Sua playlist: https://seuapp.onrender.com/playlist.m3u
+
+5. ALTERNATIVA LOCAL (COM sign.php)
+────────────────────────────────────
+Se quiser rodar no PC:
+
+  python mega_scraper.py
+
+Escolha a opcao "Re-signar URLs via sign.php + Catbox"
+Isso gera tokens frescos via sign.php antes de subir pro Catbox.
+
+Ou direto:
+
+  python scraper_auto.py --qty 100 --sign
+
+6. ARQUIVOS DO SISTEMA
+───────────────────────
+web_scraper.py     → Proxy Flask (deploy no Render)
+scraper_auto.py    → Scraper automatico com --sign
+mega_scraper.py    → Scraper interativo com sign.php
+playlist.m3u       → Playlist gerada (ou proxy)
+playlist.json      → Dados dos filmes
+megembed_scraper.bat→ Atalho Windows
+a explicacao.txt   → Este arquivo
+
+7. PERGUNTAS FREQUENTES
+────────────────────────
+P: Funciona sem meu PC ligado?
+R: SIM! O proxy no Render.com gera tokens na hora do acesso.
+
+P: Nao precisa de GitHub Actions?
+R: NAO. O proxy elimina a necessidade de re-scrape agendado.
+
+P: Os tokens expiram ainda?
+R: Sim, mas o proxy gera um NOVO token cada vez que alguem
+   acessa o link. E como se cada assistida tivesse um token novo.
+
+P: E o Catbox?
+R: Ainda pode usar! O `scraper_auto.py` faz upload pro Catbox
+   com links diretos. Mas o proxy e mais recomendado porque
+   gera tokens frescos sob demanda.
