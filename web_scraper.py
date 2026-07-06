@@ -255,7 +255,9 @@ def scrape():
     try:
         raw = fetch(API_MOVIE_URL)
         if not raw:
-            return "Erro na API", 500
+            raw = fetch(API_MOVIE_URL, use_cf=True)
+        if not raw:
+            return "Erro na API - nao foi possivel acessar mgeb.top (Cloudflare?)", 500
         ids = json.loads(raw)
         total = len(ids)
         movies = ids[start:start+qty]
