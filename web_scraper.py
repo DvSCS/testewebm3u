@@ -3,6 +3,8 @@ import re
 import json
 import time
 import os
+import sys
+import traceback
 from urllib.parse import urlparse, unquote, urljoin
 from flask import Flask, request, render_template_string, Response, redirect
 
@@ -34,21 +36,14 @@ HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
     "Referer": "https://mgeb.top/",
     "Origin": "https://mgeb.top",
-    "Sec-Ch-Ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1",
-    "Connection": "keep-alive",
 }
 
 session = requests.Session()
 session.headers.update(HEADERS)
 
 cf_session = None
+cf_init_error = None
 if HAS_CLOUDSCRAPER:
     try:
         cf_session = cloudscraper.create_scraper(
@@ -56,35 +51,18 @@ if HAS_CLOUDSCRAPER:
             delay=5,
             interpreter='native',
         )
-        # NÃO atualize os headers do cf_session com HEADERS customizados.
-        # Isso quebra o fingerprint do cloudscraper e causa bloqueio no Cloudflare!
-        # cf_session.headers.update(HEADERS) 
     except Exception as e:
-        print(f"Erro ao inicializar cloudscraper: {e}")
-
-
-def warmup_scraper():
-    global SCRAPER_INITIALIZED
-    if SCRAPER_INITIALIZED:
-        return True
-    scrapers = []
-    if cf_session:
-        scrapers.append(("cloudscraper", cf_session))
-    scrapers.append(("requests", session))
-    for name, s in scrapers:
-        try:
-            r = s.get(BASE_URL, timeout=30, headers=HEADERS)
-            if r.status_code == 200:
-                SCRAPER_INITIALIZED = True
-                return True
-        except Exception:
-            continue
-    return False
+        cf_init_error = str(e)
+        print(f"cloudscraper init error: {e}")
 
 CACHED_MOVIES = []
 SCRAPE_IN_PROGRESS = False
 
 app = Flask(__name__)
+
+@app.errorhandler(500)
+def handle_500(e):
+    return {"error": "Erro interno no servidor", "detail": str(e)}, 500, {"Content-Type": "application/json"}
 
 PAGE_TEMPLATE = """
 <!DOCTYPE html>
@@ -155,9 +133,6 @@ PAGE_TEMPLATE = """
                 <input type="number" name="start" value="1" min="1" style="flex:1;min-width:100px;margin:0;">
                 <button type="submit">Scrapear</button>
             </form>
-            {% if status %}
-            <div class="status">{{ status }}</div>
-            {% endif %}
         </div>
 
         {% if movies %}
@@ -172,33 +147,32 @@ PAGE_TEMPLATE = """
         {% endif %}
 
         <div class="card" style="text-align:center;color:#666;font-size:13px;">
-            MegaEmbed Proxy v3.0 - usa sign.php para tokens frescos sob demanda
+            MegaEmbed Proxy v4.0 - diagnostico incluido
         </div>
     </div>
 </body>
 </html>
 """
 
+LOG = []
+
+def log(msg):
+    LOG.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+    print(msg, flush=True)
+
 def is_cloudflare_challenge(text):
     if not text:
         return False
     patterns = [
-        'cf-browser-verification',
-        'cf_challenge',
-        'cloudflare',
-        'jschl-answer',
-        'challenge-platform',
-        'turnstile',
-        'Attention Required',
-        'Just a moment',
-        'cf-turnstile',
+        'cf-browser-verification', 'cf_challenge', 'cloudflare',
+        'jschl-answer', 'challenge-platform', 'turnstile',
+        'Attention Required', 'Just a moment', 'cf-turnstile',
     ]
     text_lower = text.lower()
     for p in patterns:
         if p.lower() in text_lower:
             return True
     return False
-
 
 def fetch(url, use_cf=False, retries=3):
     for i in range(retries):
@@ -208,34 +182,27 @@ def fetch(url, use_cf=False, retries=3):
                     r = curl_requests.get(url, timeout=60, impersonate="chrome124")
                     if r.status_code == 200 and not is_cloudflare_challenge(r.text):
                         return r.text
-                    else:
-                        print(f"[curl_cffi] Status {r.status_code} ou Cloudflare challenge detectado em {url}")
                 except Exception as e:
-                    print(f"[curl_cffi] Erro ao acessar {url}: {e}")
+                    log(f"[curl_cffi] {url}: {e}")
 
             if use_cf and cf_session:
                 try:
                     r = cf_session.get(url, timeout=60)
                     if r.status_code == 200 and not is_cloudflare_challenge(r.text):
                         return r.text
-                    else:
-                        print(f"[cloudscraper] Status {r.status_code} ou Cloudflare challenge detectado em {url}")
                 except Exception as e:
-                    print(f"[cloudscraper] Erro ao acessar {url}: {e}")
+                    log(f"[cloudscraper] {url}: {e}")
 
             s = cf_session if (use_cf and cf_session) else session
             try:
                 r = s.get(url, timeout=60)
                 if r.status_code == 200 and not is_cloudflare_challenge(r.text):
                     return r.text
-                else:
-                    print(f"[requests] Status {r.status_code} ou Cloudflare challenge em {url}")
             except Exception as e:
-                print(f"[requests] Erro ao acessar {url}: {e}")
-
+                log(f"[requests] {url}: {e}")
         except Exception as e:
-            print(f"Erro geral no fetch para {url}: {e}")
-            
+            log(f"[fetch] {url}: {e}")
+
         if i < retries - 1:
             time.sleep(3 * (i + 1))
     return None
@@ -343,50 +310,78 @@ def index():
 
 @app.route("/scrape", methods=["POST"])
 def scrape():
-    global CACHED_MOVIES, SCRAPE_IN_PROGRESS
-    if SCRAPE_IN_PROGRESS:
-        return redirect("/")
-    qty = int(request.form.get("qty", 50))
-    start = int(request.form.get("start", 1)) - 1
-    SCRAPE_IN_PROGRESS = True
+    global CACHED_MOVIES, SCRAPE_IN_PROGRESS, LOG
     try:
-        warmup_scraper()
+        if SCRAPE_IN_PROGRESS:
+            return redirect("/")
+        qty = int(request.form.get("qty", 50))
+        start = int(request.form.get("start", 1)) - 1
+        SCRAPE_IN_PROGRESS = True
+        LOG = []
+        log("Iniciando scrape...")
+
+        log(f"cloudscraper: {HAS_CLOUDSCRAPER}, cf_session: {cf_session is not None}, cf_init_error: {cf_init_error}")
+        log(f"curl_cffi: {HAS_CURL_CFFI}")
+
         raw = fetch(API_MOVIE_URL, use_cf=False)
+        log(f"API fetch (no cf): {'OK' if raw else 'FALHOU'} ({len(raw) if raw else 0} bytes)")
+
         if not raw:
             raw = fetch(API_MOVIE_URL, use_cf=True)
+            log(f"API fetch (com cf): {'OK' if raw else 'FALHOU'}")
+
         if not raw:
             raw = fetch(API_MOVIE_URL, use_cf=True, retries=5)
+            log(f"API fetch (cf retry 5): {'OK' if raw else 'FALHOU'}")
+
         if not raw:
-            return "Erro na API - nao foi possivel acessar mgeb.top (Cloudflare?)", 500
+            log("ERRO: API inacessivel (Cloudflare?)")
+            return {"error": "API inacessivel", "logs": LOG[-20:]}, 500
+
         try:
             ids = json.loads(raw)
-        except (json.JSONDecodeError, ValueError) as e:
-            return f"Erro ao processar resposta da API: {e}. A API retornou conteudo invalido (Cloudflare bloqueando?)", 500
+            log(f"API JSON parse OK: {len(ids)} filmes")
+        except Exception as e:
+            log(f"ERRO JSON: {e}")
+            log(f"Primeiros 500 chars: {raw[:500]}")
+            return {"error": f"JSON invalido: {e}", "preview": raw[:200], "logs": LOG[-20:]}, 500
+
         if not isinstance(ids, list):
-            return "Erro: API retornou formato inesperado (nao é uma lista)", 500
+            return {"error": "API retornou formato invalido", "logs": LOG[-20:]}, 500
+
         total = len(ids)
         movies = ids[start:start+qty]
+        log(f"Processando {len(movies)} filmes (de {total} disponiveis)")
+
         all_movies = []
         errors = 0
         for i, tmdb_id in enumerate(movies):
-            html = fetch(EMBED_URL.format(tmdb_id))
-            if not html:
-                html = fetch(EMBED_URL.format(tmdb_id), use_cf=True)
-            if not html:
+            try:
+                html = fetch(EMBED_URL.format(tmdb_id))
+                if not html:
+                    html = fetch(EMBED_URL.format(tmdb_id), use_cf=True)
+                if not html:
+                    errors += 1
+                    continue
+                title, poster, sources, fallback = extract_sources(html)
+                best = pick_best(sources, fallback)
+                if not best:
+                    errors += 1
+                    continue
+                all_movies.append({"tmdb_id": str(tmdb_id), "title": title, "poster": poster, "source": best})
+            except Exception as e:
                 errors += 1
-                continue
-            title, poster, sources, fallback = extract_sources(html)
-            best = pick_best(sources, fallback)
-            if not best:
-                errors += 1
-                continue
-            all_movies.append({"tmdb_id": str(tmdb_id), "title": title, "poster": poster, "source": best})
+                log(f"Erro no filme {tmdb_id}: {e}")
+
+        log(f"OK: {len(all_movies)}, Erros: {errors}")
         CACHED_MOVIES = all_movies
+
         try:
             with open("playlist.json", "w", encoding="utf-8") as f:
                 json.dump(all_movies, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"Erro ao salvar playlist.json: {e}")
+            log(f"Erro ao salvar playlist.json: {e}")
+
         if all_movies:
             m3u_lines = ["#EXTM3U"]
             for m in all_movies:
@@ -398,7 +393,7 @@ def scrape():
                     with open(name, "w", encoding="utf-8") as f:
                         f.write(m3u)
                 except Exception as e:
-                    print(f"Erro ao salvar {name}: {e}")
+                    log(f"Erro ao salvar {name}: {e}")
             try:
                 with open("playlist_static.txt", "rb") as f:
                     r = requests.post("https://catbox.moe/user/api.php",
@@ -408,10 +403,15 @@ def scrape():
                     with open("catbox_url.txt", "w") as f:
                         f.write(r.text.strip())
             except Exception as e:
-                print(f"Erro no upload Catbox: {e}")
+                log(f"Erro Catbox: {e}")
+
+        return redirect("/")
+    except Exception as e:
+        tb = traceback.format_exc()
+        log(f"ERRO FATAL: {e}\n{tb}")
+        return {"error": str(e), "traceback": tb, "logs": LOG[-20:]}, 500
     finally:
         SCRAPE_IN_PROGRESS = False
-    return redirect("/")
 
 @app.route("/proxy/<tmdb_id>")
 def proxy_play(tmdb_id):
@@ -458,7 +458,11 @@ def playlist_txt():
 
 @app.route("/health")
 def health():
-    return {"status": "ok", "movies": len(CACHED_MOVIES) if CACHED_MOVIES else 0}
+    return {"status": "ok", "movies": len(CACHED_MOVIES) if CACHED_MOVIES else 0, "cf_available": HAS_CLOUDSCRAPER, "cf_working": cf_session is not None, "cf_error": cf_init_error}
+
+@app.route("/diagnostic")
+def diagnostic():
+    return {"logs": LOG[-50:], "movies_cached": len(CACHED_MOVIES), "scrape_in_progress": SCRAPE_IN_PROGRESS, "cf_available": HAS_CLOUDSCRAPER, "cf_working": cf_session is not None, "cf_error": cf_init_error, "curl_cffi": HAS_CURL_CFFI}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
