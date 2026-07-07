@@ -10,7 +10,6 @@ from flask import Flask, request, render_template_string, Response, redirect
 
 HAS_CLOUDSCRAPER = False
 HAS_CURL_CFFI = False
-SCRAPER_INITIALIZED = False
 
 try:
     import cloudscraper
@@ -57,12 +56,26 @@ if HAS_CLOUDSCRAPER:
 
 CACHED_MOVIES = []
 SCRAPE_IN_PROGRESS = False
+LOG_FILE = "scrape_log.txt"
 
 app = Flask(__name__)
 
+def file_log(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except:
+        pass
+
+file_log("App iniciou")
+
 @app.errorhandler(500)
 def handle_500(e):
-    return {"error": "Erro interno no servidor", "detail": str(e)}, 500, {"Content-Type": "application/json"}
+    file_log(f"HTTP 500: {e}")
+    return {"error": "Erro interno no servidor", "detail": str(e)}, 500
 
 PAGE_TEMPLATE = """
 <!DOCTYPE html>
@@ -89,22 +102,15 @@ PAGE_TEMPLATE = """
         .nav-links { display: flex; gap: 12px; margin-top: 16px; flex-wrap: wrap; }
         .nav-links a { color: #6c5ce7; text-decoration: none; padding: 8px 16px; border: 1px solid #6c5ce7; border-radius: 8px; font-size: 14px; }
         .nav-links a:hover { background: #6c5ce7; color: #fff; }
-        .badge { display: inline-block; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
-        .badge-green { background: rgba(0,214,143,.15); color: #00d68f; }
         @media (max-width: 600px) { .container { padding: 20px 12px; } .card { padding: 20px; } }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>MegaEmbed Proxy</h1>
-        <p class="subtitle">Tokens gerados sob demanda via sign.php - sem GitHub Actions, sem PC ligado</p>
-
+        <p class="subtitle">Tokens gerados sob demanda via sign.php</p>
         <div class="card">
-            <h3 style="margin-bottom:12px;">PLAYLIST PROXY (RECOMENDADO)</h3>
-            <p style="color:#888;font-size:14px;margin-bottom:12px;">
-                Cada link gera um token FRESCO na hora do acesso via <code>sign.php</code>.
-                Nao precisa re-scrapear. O link da playlist nunca expira.
-            </p>
+            <h3 style="margin-bottom:12px;">PLAYLIST PROXY</h3>
             {% if proxy_url %}
             <div class="link-box">
                 <a href="{{ proxy_url }}" target="_blank">{{ proxy_url }}</a>
@@ -116,17 +122,15 @@ PAGE_TEMPLATE = """
                 <a href="/playlist.txt">Playlist TXT</a>
             </div>
         </div>
-
         {% if catbox_url %}
         <div class="card" style="border-color:#00d68f;">
             <h3 style="margin-bottom:12px;color:#00d68f;">Catbox (cache estatico)</h3>
             <div class="link-box" style="border-color:#00d68f;">
                 <a href="{{ catbox_url }}" target="_blank">{{ catbox_url }}</a>
-                <div class="link-label">Versao estatica com links fixos - expira em horas/dias</div>
+                <div class="link-label">Versao estatica com links fixos</div>
             </div>
         </div>
         {% endif %}
-
         <div class="card">
             <form method="POST" action="/scrape" style="display:flex;gap:12px;flex-wrap:wrap;">
                 <input type="number" name="qty" value="50" min="1" style="flex:1;min-width:100px;margin:0;">
@@ -134,7 +138,6 @@ PAGE_TEMPLATE = """
                 <button type="submit">Scrapear</button>
             </form>
         </div>
-
         {% if movies %}
         <div class="card">
             <h3 style="margin-bottom:12px;">Filmes ({{ movies|length }})</h3>
@@ -145,20 +148,13 @@ PAGE_TEMPLATE = """
             </div>
         </div>
         {% endif %}
-
         <div class="card" style="text-align:center;color:#666;font-size:13px;">
-            MegaEmbed Proxy v4.0 - diagnostico incluido
+            MegaEmbed Proxy v4.1 - log em arquivo
         </div>
     </div>
 </body>
 </html>
 """
-
-LOG = []
-
-def log(msg):
-    LOG.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
-    print(msg, flush=True)
 
 def is_cloudflare_challenge(text):
     if not text:
@@ -183,7 +179,7 @@ def fetch(url, use_cf=False, retries=3):
                     if r.status_code == 200 and not is_cloudflare_challenge(r.text):
                         return r.text
                 except Exception as e:
-                    log(f"[curl_cffi] {url}: {e}")
+                    file_log(f"[curl_cffi] {url}: {e}")
 
             if use_cf and cf_session:
                 try:
@@ -191,7 +187,7 @@ def fetch(url, use_cf=False, retries=3):
                     if r.status_code == 200 and not is_cloudflare_challenge(r.text):
                         return r.text
                 except Exception as e:
-                    log(f"[cloudscraper] {url}: {e}")
+                    file_log(f"[cloudscraper] {url}: {e}")
 
             s = cf_session if (use_cf and cf_session) else session
             try:
@@ -199,9 +195,9 @@ def fetch(url, use_cf=False, retries=3):
                 if r.status_code == 200 and not is_cloudflare_challenge(r.text):
                     return r.text
             except Exception as e:
-                log(f"[requests] {url}: {e}")
+                file_log(f"[requests] {url}: {e}")
         except Exception as e:
-            log(f"[fetch] {url}: {e}")
+            file_log(f"[fetch] {url}: {e}")
 
         if i < retries - 1:
             time.sleep(3 * (i + 1))
@@ -306,56 +302,62 @@ def index():
             catbox_url = f.read().strip()
     return render_template_string(PAGE_TEMPLATE,
         proxy_url=proxy_url, catbox_url=catbox_url,
-        movies=CACHED_MOVIES, status=None)
+        movies=CACHED_MOVIES)
 
-@app.route("/scrape", methods=["POST"])
+@app.route("/scrape", methods=["GET", "POST", "OPTIONS"])
 def scrape():
-    global CACHED_MOVIES, SCRAPE_IN_PROGRESS, LOG
+    global CACHED_MOVIES, SCRAPE_IN_PROGRESS
+    file_log(f"/scrape {request.method} de {request.remote_addr}")
+
+    if request.method == "OPTIONS":
+        return Response(headers={"Allow": "GET, POST", "Access-Control-Allow-Origin": "*"})
+
+    if request.method == "GET":
+        return {"message": "Use POST para scrapear", "cached": len(CACHED_MOVIES), "in_progress": SCRAPE_IN_PROGRESS}
+
     try:
         if SCRAPE_IN_PROGRESS:
             return redirect("/")
+
         qty = int(request.form.get("qty", 50))
         start = int(request.form.get("start", 1)) - 1
         SCRAPE_IN_PROGRESS = True
-        LOG = []
-        log("Iniciando scrape...")
 
-        log(f"cloudscraper: {HAS_CLOUDSCRAPER}, cf_session: {cf_session is not None}, cf_init_error: {cf_init_error}")
-        log(f"curl_cffi: {HAS_CURL_CFFI}")
+        file_log(f"Iniciando: qty={qty}, start={start}")
+        file_log(f"cloudscraper: ok={cf_session is not None}, curl_cffi={HAS_CURL_CFFI}")
 
         raw = fetch(API_MOVIE_URL, use_cf=False)
-        log(f"API fetch (no cf): {'OK' if raw else 'FALHOU'} ({len(raw) if raw else 0} bytes)")
+        file_log(f"API fetch (no cf): {'OK' if raw else 'FALHOU'} ({len(raw) if raw else 0} chars)")
 
         if not raw:
             raw = fetch(API_MOVIE_URL, use_cf=True)
-            log(f"API fetch (com cf): {'OK' if raw else 'FALHOU'}")
+            file_log(f"API fetch (com cf): {'OK' if raw else 'FALHOU'}")
 
         if not raw:
             raw = fetch(API_MOVIE_URL, use_cf=True, retries=5)
-            log(f"API fetch (cf retry 5): {'OK' if raw else 'FALHOU'}")
+            file_log(f"API fetch (cf 5x): {'OK' if raw else 'FALHOU'}")
 
         if not raw:
-            log("ERRO: API inacessivel (Cloudflare?)")
-            return {"error": "API inacessivel", "logs": LOG[-20:]}, 500
+            file_log("ERRO: API inacessivel")
+            return {"error": "API inacessivel (Cloudflare?)"}, 500
 
         try:
             ids = json.loads(raw)
-            log(f"API JSON parse OK: {len(ids)} filmes")
+            file_log(f"JSON OK: {len(ids)} filmes")
         except Exception as e:
-            log(f"ERRO JSON: {e}")
-            log(f"Primeiros 500 chars: {raw[:500]}")
-            return {"error": f"JSON invalido: {e}", "preview": raw[:200], "logs": LOG[-20:]}, 500
+            file_log(f"ERRO JSON: {e}")
+            file_log(f"Preview: {raw[:300]}")
+            return {"error": f"JSON invalido: {e}", "preview": raw[:200]}, 500
 
         if not isinstance(ids, list):
-            return {"error": "API retornou formato invalido", "logs": LOG[-20:]}, 500
+            return {"error": "Formato inesperado"}, 500
 
-        total = len(ids)
-        movies = ids[start:start+qty]
-        log(f"Processando {len(movies)} filmes (de {total} disponiveis)")
+        movies_to_scrape = ids[start:start+qty]
+        file_log(f"Processando {len(movies_to_scrape)} filmes")
 
         all_movies = []
         errors = 0
-        for i, tmdb_id in enumerate(movies):
+        for i, tmdb_id in enumerate(movies_to_scrape):
             try:
                 html = fetch(EMBED_URL.format(tmdb_id))
                 if not html:
@@ -371,16 +373,16 @@ def scrape():
                 all_movies.append({"tmdb_id": str(tmdb_id), "title": title, "poster": poster, "source": best})
             except Exception as e:
                 errors += 1
-                log(f"Erro no filme {tmdb_id}: {e}")
+                file_log(f"Erro filme {tmdb_id}: {e}")
 
-        log(f"OK: {len(all_movies)}, Erros: {errors}")
+        file_log(f"OK: {len(all_movies)}, Erros: {errors}")
         CACHED_MOVIES = all_movies
 
         try:
             with open("playlist.json", "w", encoding="utf-8") as f:
                 json.dump(all_movies, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            log(f"Erro ao salvar playlist.json: {e}")
+            file_log(f"Erro playlist.json: {e}")
 
         if all_movies:
             m3u_lines = ["#EXTM3U"]
@@ -393,7 +395,7 @@ def scrape():
                     with open(name, "w", encoding="utf-8") as f:
                         f.write(m3u)
                 except Exception as e:
-                    log(f"Erro ao salvar {name}: {e}")
+                    file_log(f"Erro salvar {name}: {e}")
             try:
                 with open("playlist_static.txt", "rb") as f:
                     r = requests.post("https://catbox.moe/user/api.php",
@@ -403,13 +405,13 @@ def scrape():
                     with open("catbox_url.txt", "w") as f:
                         f.write(r.text.strip())
             except Exception as e:
-                log(f"Erro Catbox: {e}")
+                file_log(f"Erro Catbox: {e}")
 
         return redirect("/")
     except Exception as e:
         tb = traceback.format_exc()
-        log(f"ERRO FATAL: {e}\n{tb}")
-        return {"error": str(e), "traceback": tb, "logs": LOG[-20:]}, 500
+        file_log(f"ERRO FATAL: {e}\n{tb}")
+        return {"error": str(e), "traceback": tb}, 500
     finally:
         SCRAPE_IN_PROGRESS = False
 
@@ -427,7 +429,7 @@ def playlist_m3u():
         with open("playlist.json") as f:
             CACHED_MOVIES = json.load(f)
     if not CACHED_MOVIES:
-        return "Nenhum filme cacheado. Acesse / para scrapear.", 404
+        return "Nenhum filme cacheado.", 404
     base = request.host_url.rstrip("/")
     lines = ["#EXTM3U"]
     for m in CACHED_MOVIES:
@@ -458,12 +460,16 @@ def playlist_txt():
 
 @app.route("/health")
 def health():
-    return {"status": "ok", "movies": len(CACHED_MOVIES) if CACHED_MOVIES else 0, "cf_available": HAS_CLOUDSCRAPER, "cf_working": cf_session is not None, "cf_error": cf_init_error}
+    return {"status": "ok", "movies": len(CACHED_MOVIES) if CACHED_MOVIES else 0}
 
-@app.route("/diagnostic")
-def diagnostic():
-    return {"logs": LOG[-50:], "movies_cached": len(CACHED_MOVIES), "scrape_in_progress": SCRAPE_IN_PROGRESS, "cf_available": HAS_CLOUDSCRAPER, "cf_working": cf_session is not None, "cf_error": cf_init_error, "curl_cffi": HAS_CURL_CFFI}
+@app.route("/log")
+def view_log():
+    if not os.path.exists(LOG_FILE):
+        return {"log": []}
+    with open(LOG_FILE, encoding="utf-8") as f:
+        lines = f.readlines()
+    return {"log": lines[-50:]}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
