@@ -358,7 +358,12 @@ def scrape():
             raw = fetch(API_MOVIE_URL, use_cf=True, retries=5)
         if not raw:
             return "Erro na API - nao foi possivel acessar mgeb.top (Cloudflare?)", 500
-        ids = json.loads(raw)
+        try:
+            ids = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as e:
+            return f"Erro ao processar resposta da API: {e}. A API retornou conteudo invalido (Cloudflare bloqueando?)", 500
+        if not isinstance(ids, list):
+            return "Erro: API retornou formato inesperado (nao é uma lista)", 500
         total = len(ids)
         movies = ids[start:start+qty]
         all_movies = []
@@ -377,9 +382,11 @@ def scrape():
                 continue
             all_movies.append({"tmdb_id": str(tmdb_id), "title": title, "poster": poster, "source": best})
         CACHED_MOVIES = all_movies
-        with open("playlist.json", "w", encoding="utf-8") as f:
-            json.dump(all_movies, f, ensure_ascii=False, indent=2)
-        # Upload estatico para Catbox
+        try:
+            with open("playlist.json", "w", encoding="utf-8") as f:
+                json.dump(all_movies, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Erro ao salvar playlist.json: {e}")
         if all_movies:
             m3u_lines = ["#EXTM3U"]
             for m in all_movies:
@@ -387,8 +394,11 @@ def scrape():
                 m3u_lines.append(m["source"]["file"])
             m3u = "\n".join(m3u_lines)
             for name in ["playlist_static.txt", "playlist_static.m3u"]:
-                with open(name, "w", encoding="utf-8") as f:
-                    f.write(m3u)
+                try:
+                    with open(name, "w", encoding="utf-8") as f:
+                        f.write(m3u)
+                except Exception as e:
+                    print(f"Erro ao salvar {name}: {e}")
             try:
                 with open("playlist_static.txt", "rb") as f:
                     r = requests.post("https://catbox.moe/user/api.php",
@@ -397,7 +407,8 @@ def scrape():
                 if r.status_code == 200 and r.text.startswith("http"):
                     with open("catbox_url.txt", "w") as f:
                         f.write(r.text.strip())
-            except: pass
+            except Exception as e:
+                print(f"Erro no upload Catbox: {e}")
     finally:
         SCRAPE_IN_PROGRESS = False
     return redirect("/")
