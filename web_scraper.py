@@ -6,11 +6,21 @@ import os
 from urllib.parse import urlparse, unquote, urljoin
 from flask import Flask, request, render_template_string, Response, redirect
 
+HAS_CLOUDSCRAPER = False
+HAS_CURL_CFFI = False
+SCRAPER_INITIALIZED = False
+
 try:
     import cloudscraper
     HAS_CLOUDSCRAPER = True
 except ImportError:
-    HAS_CLOUDSCRAPER = False
+    pass
+
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    pass
 
 BASE_URL = "https://mgeb.top"
 API_MOVIE_URL = f"{BASE_URL}/api/movie"
@@ -18,10 +28,21 @@ EMBED_URL = f"{BASE_URL}/embed/{{}}"
 SIGN_URL = "https://mgeb.top/includes/sign.php"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
     "Referer": "https://mgeb.top/",
+    "Origin": "https://mgeb.top",
+    "Sec-Ch-Ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Connection": "keep-alive",
 }
 
 session = requests.Session()
@@ -29,9 +50,36 @@ session.headers.update(HEADERS)
 
 cf_session = None
 if HAS_CLOUDSCRAPER:
-    cf_session = cloudscraper.create_scraper(
-        browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False}
-    )
+    try:
+        cf_session = cloudscraper.create_scraper(
+            browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
+            delay=5,
+            interpreter='native',
+        )
+        # NÃO atualize os headers do cf_session com HEADERS customizados.
+        # Isso quebra o fingerprint do cloudscraper e causa bloqueio no Cloudflare!
+        # cf_session.headers.update(HEADERS) 
+    except Exception as e:
+        print(f"Erro ao inicializar cloudscraper: {e}")
+
+
+def warmup_scraper():
+    global SCRAPER_INITIALIZED
+    if SCRAPER_INITIALIZED:
+        return True
+    scrapers = []
+    if cf_session:
+        scrapers.append(("cloudscraper", cf_session))
+    scrapers.append(("requests", session))
+    for name, s in scrapers:
+        try:
+            r = s.get(BASE_URL, timeout=30, headers=HEADERS)
+            if r.status_code == 200:
+                SCRAPER_INITIALIZED = True
+                return True
+        except Exception:
+            continue
+    return False
 
 CACHED_MOVIES = []
 SCRAPE_IN_PROGRESS = False
@@ -131,16 +179,65 @@ PAGE_TEMPLATE = """
 </html>
 """
 
+def is_cloudflare_challenge(text):
+    if not text:
+        return False
+    patterns = [
+        'cf-browser-verification',
+        'cf_challenge',
+        'cloudflare',
+        'jschl-answer',
+        'challenge-platform',
+        'turnstile',
+        'Attention Required',
+        'Just a moment',
+        'cf-turnstile',
+    ]
+    text_lower = text.lower()
+    for p in patterns:
+        if p.lower() in text_lower:
+            return True
+    return False
+
+
 def fetch(url, use_cf=False, retries=3):
-    s = cf_session if (use_cf and cf_session) else session
     for i in range(retries):
         try:
-            r = s.get(url, timeout=30)
-            if r.status_code == 200:
-                return r.text
-        except:
-            if i < retries - 1:
-                time.sleep(2 ** i)
+            if use_cf and HAS_CURL_CFFI:
+                try:
+                    r = curl_requests.get(url, timeout=60, impersonate="chrome124")
+                    if r.status_code == 200 and not is_cloudflare_challenge(r.text):
+                        return r.text
+                    else:
+                        print(f"[curl_cffi] Status {r.status_code} ou Cloudflare challenge detectado em {url}")
+                except Exception as e:
+                    print(f"[curl_cffi] Erro ao acessar {url}: {e}")
+
+            if use_cf and cf_session:
+                try:
+                    r = cf_session.get(url, timeout=60)
+                    if r.status_code == 200 and not is_cloudflare_challenge(r.text):
+                        return r.text
+                    else:
+                        print(f"[cloudscraper] Status {r.status_code} ou Cloudflare challenge detectado em {url}")
+                except Exception as e:
+                    print(f"[cloudscraper] Erro ao acessar {url}: {e}")
+
+            s = cf_session if (use_cf and cf_session) else session
+            try:
+                r = s.get(url, timeout=60)
+                if r.status_code == 200 and not is_cloudflare_challenge(r.text):
+                    return r.text
+                else:
+                    print(f"[requests] Status {r.status_code} ou Cloudflare challenge em {url}")
+            except Exception as e:
+                print(f"[requests] Erro ao acessar {url}: {e}")
+
+        except Exception as e:
+            print(f"Erro geral no fetch para {url}: {e}")
+            
+        if i < retries - 1:
+            time.sleep(3 * (i + 1))
     return None
 
 def clean_url(url):
@@ -253,9 +350,12 @@ def scrape():
     start = int(request.form.get("start", 1)) - 1
     SCRAPE_IN_PROGRESS = True
     try:
-        raw = fetch(API_MOVIE_URL)
+        warmup_scraper()
+        raw = fetch(API_MOVIE_URL, use_cf=False)
         if not raw:
             raw = fetch(API_MOVIE_URL, use_cf=True)
+        if not raw:
+            raw = fetch(API_MOVIE_URL, use_cf=True, retries=5)
         if not raw:
             return "Erro na API - nao foi possivel acessar mgeb.top (Cloudflare?)", 500
         ids = json.loads(raw)
